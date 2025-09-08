@@ -1,0 +1,15 @@
+{
+  "name": "generate-font",
+  "version": "1.0.0",
+  "description": "Script to generate font from SVG files",
+  "main": "generate-font.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node generate-font.mjs"
+  },
+  "dependencies": {
+    "svg2ttf": "^6.0.3",
+    "svgicons2svgfont": "^15.0.0",
+    "ttf2woff2": "^6.0.1"
+  }
+}
