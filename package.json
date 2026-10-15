@@ -5,7 +5,11 @@
   "main": "generate-font.mjs",
   "type": "module",
   "scripts": {
-    "start": "node generate-font.mjs"
+    "start": "node generate-font.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20.11.1"
   },
   "dependencies": {
     "svg2ttf": "^6.0.3",

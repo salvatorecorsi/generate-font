@@ -1,0 +1,5 @@
+node_modules/
+/icons/*.woff2
+/icons/*.ttf
+/icons/*.css
+/icons/*.html

@@ -1,204 +1,211 @@
-import fs from 'fs';
-import path from 'path';
-import crypto from 'crypto';
-import readline from 'readline';
+import fs from 'node:fs';
+import path from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { parseArgs } from 'node:util';
 
 import { SVGIcons2SVGFontStream } from 'svgicons2svgfont';
 import svg2ttf from 'svg2ttf';
 import ttf2woff2 from 'ttf2woff2';
 
-// Create readline interface for user input
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout
-});
+function readGlyphs(inputDirectory) {
+  const files = fs.readdirSync(inputDirectory, { withFileTypes: true })
+    .filter(file => file.isFile() && path.extname(file.name).toLowerCase() === '.svg')
+    .map(file => file.name)
+    .sort();
 
-/**
- * Reads all SVG files from the specified directory.
- * @param {string} directory - The directory to read SVG files from.
- * @returns {string[]} - Array of SVG file paths.
- */
-const readSVGFiles = (directory) => {
-  return fs.readdirSync(directory)
-    .filter(file => file.endsWith('.svg'))
-    .map(file => path.join(directory, file));
-};
+  if (!files.length) throw new Error(`Nessun SVG trovato in ${inputDirectory}.`);
 
-/**
- * Calculates an MD5 hash based on the SVG files' names and sizes.
- * @param {string[]} svgFiles - Array of SVG file paths.
- * @returns {string} - The computed hash as a hexadecimal string.
- */
-const getSVGFilesHash = (svgFiles) => {
-  const hash = crypto.createHash('md5');
-  hash.update(svgFiles.length.toString()); // Number of files
-  svgFiles.forEach(file => {
-    const stats = fs.statSync(file);
-    hash.update(file); // File name
-    hash.update(stats.size.toString()); // File size
+  const names = new Set();
+
+  return files.map(file => {
+    const name = path.parse(file).name.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+
+    if (!name) throw new Error(`Il file ${file} deve avere un nome con lettere o numeri.`);
+    if (names.has(name)) throw new Error(`Nome duplicato dopo la normalizzazione: ${name}.`);
+    names.add(name);
+
+    return { name, source: fs.readFileSync(path.join(inputDirectory, file), 'utf8') };
   });
-  return hash.digest('hex');
-};
+}
 
-/**
- * Sanitizes a glyph name by replacing non-alphanumeric characters with hyphens.
- * @param {string} name - The original glyph name.
- * @returns {string} - The sanitized glyph name.
- */
-const sanitizeGlyphName = (name) => {
-  return name.replace(/[^a-zA-Z0-9]/g, '-');
-};
+function assignCodepoints(glyphs, mappingPath) {
+  const codepoints = new Map();
+  const occupied = new Set();
 
-/**
- * Writes content to a file.
- * @param {string} filePath - The path to the file.
- * @param {Buffer|string} content - The content to write.
- */
-const saveFile = (filePath, content) => {
-  fs.writeFileSync(filePath, content);
-};
+  if (fs.existsSync(mappingPath)) {
+    const saved = JSON.parse(fs.readFileSync(mappingPath, 'utf8'));
 
-/**
- * Generates the font files (SVG, TTF, WOFF2) and corresponding CSS.
- * @param {string[]} svgFiles - Array of SVG file paths.
- * @param {string} fontName - The name of the generated font.
- * @param {string} outputDir - The directory where the output files will be saved.
- */
-const generateFont = async (svgFiles, fontName, outputDir) => {
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) {
+      throw new Error(`Mappa dei glifi non valida: ${mappingPath}.`);
+    }
+
+    for (const [name, codepoint] of Object.entries(saved)) {
+      if (!Number.isInteger(codepoint) || codepoint < 0xe000 || codepoint > 0xf8ff || occupied.has(codepoint)) {
+        throw new Error(`Codice non valido o duplicato per ${name} in ${mappingPath}.`);
+      }
+
+      codepoints.set(name, codepoint);
+      occupied.add(codepoint);
+    }
+  }
+
+  let nextCodepoint = 0xe000;
+
+  for (const glyph of glyphs) {
+    if (!codepoints.has(glyph.name)) {
+      while (occupied.has(nextCodepoint)) nextCodepoint++;
+      if (nextCodepoint > 0xf8ff) throw new Error('Esauriti i 6400 codici Unicode privati disponibili.');
+      codepoints.set(glyph.name, nextCodepoint);
+      occupied.add(nextCodepoint);
+    }
+
+    glyph.codepoint = codepoints.get(glyph.name);
+  }
+
+  return Object.fromEntries(codepoints);
+}
+
+async function createSvgFont(glyphs, fontName) {
   const fontStream = new SVGIcons2SVGFontStream({
-    fontName: fontName,
+    fontName,
     fontHeight: 1000,
     normalize: true,
     descent: 0,
   });
-
-  const cssContent = [];
-  const svgChunks = [];
-
-  svgFiles.forEach((file, index) => {
-    const glyph = fs.createReadStream(file);
-    const glyphName = sanitizeGlyphName(path.basename(file, '.svg'));
-    const unicode = String.fromCharCode(0xe000 + index); // Private Use Area
-    glyph.metadata = {
-      unicode: [unicode],
-      name: glyphName,
+  const glyphStreams = glyphs.map(glyph => {
+    const glyphStream = Readable.from([glyph.source]);
+    glyphStream.metadata = {
+      name: glyph.name,
+      unicode: [String.fromCodePoint(glyph.codepoint)],
     };
-    fontStream.write(glyph);
+    return glyphStream;
+  });
+  const chunks = [];
 
-    // Generate corresponding CSS class
-    cssContent.push(`.icon-${glyphName}:before { content: "\\${unicode.charCodeAt(0).toString(16)}"; }`);
+  await pipeline(Readable.from(glyphStreams), fontStream, async chunksStream => {
+    for await (const chunk of chunksStream) chunks.push(Buffer.from(chunk));
   });
 
-  fontStream.end();
+  const svgFont = Buffer.concat(chunks).toString('utf8');
+  const emptyGlyph = svgFont.match(/<glyph glyph-name="([^"]+)"[^>]*\sd=""\s*\/>/);
+  if (emptyGlyph) throw new Error(`Il glifo ${emptyGlyph[1]} non contiene tracciati pieni. Espandi i tratti prima di esportare.`);
 
-  fontStream.on('data', (chunk) => {
-    // Ensure the chunk is a Buffer
-    if (Buffer.isBuffer(chunk)) {
-      svgChunks.push(chunk);
-    } else {
-      svgChunks.push(Buffer.from(chunk, 'utf8'));
-    }
+  return svgFont;
+}
+
+function createCss(glyphs, fontName) {
+  const fontSelectors = glyphs.map(glyph => `.icon-${glyph.name}::before`).join(',\n');
+  const selectors = glyphs.map(glyph =>
+    `.icon-${glyph.name}::before { content: "\\${glyph.codepoint.toString(16)}"; }`
+  );
+
+  return `@font-face {
+  font-family: '${fontName}';
+  src: url('./${fontName}.woff2') format('woff2');
+  font-weight: normal;
+  font-style: normal;
+  font-display: block;
+}
+
+${fontSelectors} {
+  display: inline-block;
+  font-family: '${fontName}';
+  font-style: normal;
+  font-weight: normal;
+  font-variant: normal;
+  text-transform: none;
+  line-height: 1;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+${selectors.join('\n')}
+`;
+}
+
+function createPreview(glyphs, fontName) {
+  const cards = glyphs.map(glyph => `    <li><i class="icon-${glyph.name}" aria-hidden="true"></i><code>icon-${glyph.name}</code><small>U+${glyph.codepoint.toString(16).toUpperCase()}</small></li>`);
+
+  return `<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${fontName}</title>
+  <link rel="stylesheet" href="./${fontName}.css">
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { max-width: 72rem; margin: auto; padding: 2rem; }
+    h1 { margin-bottom: .5rem; }
+    p, small { opacity: .65; }
+    ul { display: grid; grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr)); gap: 1rem; padding: 0; list-style: none; }
+    li { display: grid; justify-items: center; gap: .75rem; padding: 2rem 1rem; border: 1px solid; border-radius: .25rem; }
+    i { font-size: 3rem; }
+    code { overflow-wrap: anywhere; text-align: center; }
+  </style>
+</head>
+<body>
+  <h1>${fontName}</h1>
+  <p>${glyphs.length} glifi · WOFF2 / TTF</p>
+  <ul>
+${cards.join('\n')}
+  </ul>
+</body>
+</html>
+`;
+}
+
+async function main() {
+  const { values } = parseArgs({
+    options: {
+      input: { type: 'string', default: './svg' },
+      output: { type: 'string', default: './icons' },
+      name: { type: 'string', default: 'icons' },
+      help: { type: 'boolean', short: 'h' },
+    },
   });
 
-  fontStream.on('finish', () => {
-    try {
-      const svgFontBuffer = Buffer.concat(svgChunks);
-
-      // Convert SVG to TTF
-      const ttf = svg2ttf(svgFontBuffer.toString('utf8'), {});
-      const ttfBuffer = Buffer.from(ttf.buffer);
-
-      // Convert TTF to WOFF2
-      const woff2 = ttf2woff2(ttfBuffer);
-      const woff2Path = path.join(outputDir, `${fontName}.woff2`);
-      saveFile(woff2Path, Buffer.from(woff2.buffer));
-
-      // Generate CSS file
-      const cssPath = path.join(outputDir, `${fontName}.css`);
-      const fontFace = `
-@font-face { 
-  font-family: '${fontName}'; 
-  src: url('${fontName}.woff2') format('woff2'); 
-  font-weight: normal; 
-  font-style: normal; 
-} 
-[class^="icon-"], [class*=" icon-"] { 
-  font-family: '${fontName}' !important; 
-  speak: none; 
-  font-style: normal; 
-  font-weight: normal; 
-  font-variant: normal; 
-  text-transform: none; 
-  line-height: 1; 
-  -webkit-font-smoothing: antialiased; 
-  -moz-osx-font-smoothing: grayscale; 
-}`;
-      const cssOutput = `${fontFace}\n\n${cssContent.join('\n')}`;
-      saveFile(cssPath, cssOutput);
-
-      console.log('Font generation complete! CSS and WOFF2 files have been generated.');
-      rl.close();
-    } catch (error) {
-      console.error('Error during font generation:', error);
-      rl.close();
-    }
-  });
-
-  // Handle errors in the fontStream
-  fontStream.on('error', (err) => {
-    console.error('Error in SVGIcons2SVGFontStream:', err);
-    rl.close();
-  });
-};
-
-/**
- * Main execution function.
- */
-(async () => { 
-  const currentDir = process.cwd(); 
-  const svgDirectory = path.join(currentDir, 'svg'); 
-  const outputDirectory = path.join(currentDir, 'icons'); 
-  const fontName = 'icons';
-
-  // Check if SVG directory exists
-  if (!fs.existsSync(svgDirectory)) {
-    console.log("La cartella /svg non è stata trovata");
-    process.exit(1);
+  if (values.help) {
+    console.log('Uso: node generate-font.mjs [--input ./svg] [--output ./icons] [--name icons]');
+    return;
   }
 
-  const svgFiles = readSVGFiles(svgDirectory);
-  if (svgFiles.length === 0) {
-    console.log("Nessun file SVG trovato nella cartella /svg");
-    process.exit(1);
+  if (!/^[a-zA-Z][a-zA-Z0-9_-]{0,62}$/.test(values.name)) {
+    throw new Error('Il nome del font deve iniziare con una lettera e contenere solo lettere, numeri, trattini o underscore (massimo 63 caratteri).');
   }
 
-  let needConfirmation = false;
-  if (fs.existsSync(outputDirectory)) {
-    needConfirmation = true;
-  } else {
-    // Create necessary directories if they don't exist
-    fs.mkdirSync(path.join(currentDir), { recursive: true });
-    fs.mkdirSync(outputDirectory, { recursive: true });
+  const inputDirectory = path.resolve(values.input);
+  const outputDirectory = path.resolve(values.output);
+  const fontName = values.name;
+  const mappingPath = path.join(outputDirectory, `${fontName}.json`);
+  const glyphs = readGlyphs(inputDirectory);
+  const codepoints = assignCodepoints(glyphs, mappingPath);
+  const svgFont = await createSvgFont(glyphs, fontName);
+  const ttf = Buffer.from(svg2ttf(svgFont, { ts: 0 }).buffer);
+  const woff2 = ttf2woff2(ttf);
+
+  if (woff2.length < 48 || woff2.toString('ascii', 0, 4) !== 'wOF2' || woff2.readUInt32BE(8) !== woff2.length) {
+    throw new Error('La conversione non ha prodotto un WOFF2 valido.');
   }
 
-  /**
-   * Proceeds with font generation if confirmed or if no confirmation is needed.
-   */
-  const proceed = () => {
-    generateFont(svgFiles, fontName, outputDirectory);
+  const outputs = {
+    woff2,
+    ttf,
+    css: createCss(glyphs, fontName),
+    html: createPreview(glyphs, fontName),
+    json: `${JSON.stringify(codepoints, null, 2)}\n`,
   };
 
-  if (needConfirmation) {
-    rl.question('La cartella fonts/icons esiste già. Vuoi sovrascrivere? (s/n): ', (answer) => {
-      if (answer.trim().toLowerCase() === 's') {
-        proceed();
-      } else {
-        console.log('Operazione annullata.');
-        rl.close();
-      }
-    });
-  } else {
-    proceed();
+  fs.mkdirSync(outputDirectory, { recursive: true });
+  for (const [extension, content] of Object.entries(outputs)) {
+    fs.writeFileSync(path.join(outputDirectory, `${fontName}.${extension}`), content);
   }
 
-})();
+  console.log(`${glyphs.length} glifi generati in ${outputDirectory}: WOFF2, TTF, CSS, anteprima HTML e mappa Unicode.`);
+}
+
+main().catch(error => {
+  console.error(`Errore: ${error.message}`);
+  process.exitCode = 1;
+});
